@@ -37,6 +37,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.Callback;
 
 import net.sf.scuba.smartcards.CardFileInputStream;
 import net.sf.scuba.smartcards.CardService;
@@ -48,6 +49,7 @@ import org.jmrtd.lds.COMFile;
 import org.jmrtd.lds.CardAccessFile;
 import org.jmrtd.lds.DG1File;
 import org.jmrtd.lds.DG2File;
+import org.jmrtd.lds.DG14File;
 import org.jmrtd.lds.FaceImageInfo;
 import org.jmrtd.lds.FaceInfo;
 import org.jmrtd.lds.LDS;
@@ -61,6 +63,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.security.PublicKey;
 import java.security.Security;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -68,6 +71,10 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.security.cert.X509Certificate;
+import java.security.interfaces.RSAPublicKey;
+
+import com.google.gson.Gson;
 
 public class RNPassportReaderModule extends ReactContextBaseJavaModule implements LifecycleEventListener, ActivityEventListener {
 
@@ -78,12 +85,17 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
   private static final String E_SCAN_FAILED = "E_SCAN_FAILED";
   private static final String E_SCAN_FAILED_DISCONNECT = "E_SCAN_FAILED_DISCONNECT";
   private static final String E_ONE_REQ_AT_A_TIME = "E_ONE_REQ_AT_A_TIME";
-//  private static final String E_MISSING_REQUIRED_PARAM = "E_MISSING_REQUIRED_PARAM";
+  //  private static final String E_MISSING_REQUIRED_PARAM = "E_MISSING_REQUIRED_PARAM";
   private static final String KEY_IS_SUPPORTED = "isSupported";
   private static final String KEY_FIRST_NAME = "firstName";
   private static final String KEY_LAST_NAME = "lastName";
   private static final String KEY_GENDER = "gender";
   private static final String KEY_ISSUER = "issuer";
+  private static final String KEY_PERSONAL_NUMBER = "personalNumber";
+  private static final String KEY_DOCUMENT_NUMBER = "documentNumber";
+  private static final String KEY_DATE_OF_BIRTH = "dateOfBirth";
+  private static final String KEY_EXPIRY_DATE = "documentExpiryDate";
+  private static final String KEY_DOCUMENT_TYPE = "documentType";
   private static final String KEY_NATIONALITY = "nationality";
   private static final String KEY_PHOTO = "photo";
   private static final String PARAM_DOC_NUM = "documentNumber";
@@ -101,8 +113,11 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
 
     reactContext.addLifecycleEventListener(this);
     reactContext.addActivityEventListener(this);
-
     this.reactContext = reactContext;
+  }
+
+  static {
+//    System.loadLibrary("ark_circom_passport");
   }
 
   @Override
@@ -123,7 +138,10 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
             opts.getString(PARAM_DOE)
     );
 
-    new ReadTask(IsoDep.get(tag), bacKey).execute();
+    var nfc = IsoDep.get(tag);
+    // Set the timeout to prevent Tag lost errors
+    nfc.setTimeout(1000 * 60);
+    new ReadTask(nfc, bacKey).execute();
   }
 
   @Override
@@ -189,7 +207,7 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
     Activity activity = getCurrentActivity();
     Intent intent = new Intent(activity.getApplicationContext(), activity.getClass());
     intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
-    PendingIntent pendingIntent = PendingIntent.getActivity(getCurrentActivity(), 0, intent,  PendingIntent.FLAG_MUTABLE);//PendingIntent.FLAG_UPDATE_CURRENT);
+    PendingIntent pendingIntent = PendingIntent.getActivity(getCurrentActivity(), 0, intent, PendingIntent.FLAG_MUTABLE);//PendingIntent.FLAG_UPDATE_CURRENT);
     String[][] filter = new String[][] { new String[] { IsoDep.class.getName()  } };
     mNfcAdapter.enableForegroundDispatch(getCurrentActivity(), pendingIntent, null, filter);
   }
@@ -258,7 +276,7 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
     ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
     bitmap.compress(Bitmap.CompressFormat.JPEG, quality, byteArrayOutputStream);
     byte[] byteArray = byteArrayOutputStream.toByteArray();
-    return JPEG_DATA_URI_PREFIX + Base64.encodeToString(byteArray, Base64.NO_WRAP);
+    return Base64.encodeToString(byteArray, Base64.NO_WRAP);
   }
 
   private class ReadTask extends AsyncTask<Void, Void, Exception> {
@@ -275,6 +293,7 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
     private SODFile sodFile;
     private DG1File dg1File;
     private DG2File dg2File;
+    private DG14File dg14File;
 
     private Bitmap bitmap;
 
@@ -296,8 +315,10 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
             PACEInfo paceInfo = paceInfos.iterator().next();
             service.doPACE(bacKey, paceInfo.getObjectIdentifier(), PACEInfo.toParameterSpec(paceInfo.getParameterId()));
             paceSucceeded = true;
+            Log.w(TAG, "PACE succeeded");
           } else {
             paceSucceeded = true;
+            Log.w(TAG, "PACE undefined");
           }
         } catch (Exception e) {
           Log.w(TAG, e);
@@ -315,13 +336,21 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
 
         LDS lds = new LDS();
 
-//        CardFileInputStream comIn = service.getInputStream(PassportService.EF_COM);
-//        lds.add(PassportService.EF_COM, comIn, comIn.getLength());
-//        comFile = lds.getCOMFile();
-//
-//        CardFileInputStream sodIn = service.getInputStream(PassportService.EF_SOD);
-//        lds.add(PassportService.EF_SOD, sodIn, sodIn.getLength());
-//        sodFile = lds.getSODFile();
+        CardFileInputStream comIn = service.getInputStream(PassportService.EF_COM);
+        lds.add(PassportService.EF_COM, comIn, comIn.getLength());
+        comFile = lds.getCOMFile();
+
+        CardFileInputStream sodIn = service.getInputStream(PassportService.EF_SOD);
+        lds.add(PassportService.EF_SOD, sodIn, sodIn.getLength());
+        sodFile = lds.getSODFile();
+
+        X509Certificate docSigningCertificate = sodFile.getDocSigningCertificate();
+        Log.w(TAG, "SODFile: " + docSigningCertificate);
+
+        // Most likely will be SHA256withRSA
+        String signatureAlgorithm = sodFile.getDigestEncryptionAlgorithm();
+        // Most likely will be SHA-256
+        String signerInfoDigestAlgorithm = sodFile.getSignerInfoDigestAlgorithm();
 
         CardFileInputStream dg1In = service.getInputStream(PassportService.EF_DG1);
         lds.add(PassportService.EF_DG1, dg1In, dg1In.getLength());
@@ -330,6 +359,10 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
         CardFileInputStream dg2In = service.getInputStream(PassportService.EF_DG2);
         lds.add(PassportService.EF_DG2, dg2In, dg2In.getLength());
         dg2File = lds.getDG2File();
+
+        /*CardFileInputStream dg14In = service.getInputStream(PassportService.EF_DG14);
+        lds.add(PassportService.EF_DG14, dg14In, dg14In.getLength());
+        dg14File = lds.getDG14File();*/
 
         List<FaceImageInfo> allFaceImageInfos = new ArrayList<>();
         List<FaceInfo> faceInfos = dg2File.getFaceInfos();
@@ -374,6 +407,34 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
 
       MRZInfo mrzInfo = dg1File.getMRZInfo();
 
+      Gson gson = new Gson();
+
+      WritableMap passport = Arguments.createMap();
+
+      try {
+        X509Certificate docSigningCertificate = sodFile.getDocSigningCertificate();
+
+        String signatureAlgorithm = docSigningCertificate.getSigAlgName();
+        passport.putString("signatureAlgorithm", signatureAlgorithm);
+        passport.putString("tbsCertificate", gson.toJson(docSigningCertificate.getTBSCertificate()));
+        passport.putString("dscSignature", gson.toJson(docSigningCertificate.getSignature()));
+        passport.putString("dscSignatureAlgorithm", docSigningCertificate.getSigAlgName());
+
+        PublicKey publicKey = docSigningCertificate.getPublicKey();
+        if(publicKey instanceof RSAPublicKey) {
+          RSAPublicKey rsaPublicKey = (RSAPublicKey)publicKey;
+          passport.putString("modulus", rsaPublicKey.getModulus().toString());
+          passport.putString("exponent", rsaPublicKey.getPublicExponent().toString());
+        }
+      } catch (Exception e) {
+        Log.e(TAG, "error fetching the Document Signing Certificate: " + e);
+      }
+
+      passport.putString("mrz", mrzInfo.toString());
+      passport.putString("dataGroupHashes", gson.toJson(sodFile.getDataGroupHashes()));
+      passport.putString("eContent", gson.toJson(sodFile.getEContent()));
+      passport.putString("encryptedDigest", gson.toJson(sodFile.getEncryptedDigest()));
+
       int quality = 100;
       if (opts.hasKey("quality")) {
         quality = (int)(opts.getDouble("quality") * 100);
@@ -387,16 +448,86 @@ public class RNPassportReaderModule extends ReactContextBaseJavaModule implement
 
       String firstName = mrzInfo.getSecondaryIdentifier().replace("<", "");
       String lastName = mrzInfo.getPrimaryIdentifier().replace("<", "");
-      WritableMap passport = Arguments.createMap();
+
       passport.putMap(KEY_PHOTO, photo);
       passport.putString(KEY_FIRST_NAME, firstName);
       passport.putString(KEY_LAST_NAME, lastName);
       passport.putString(KEY_NATIONALITY, mrzInfo.getNationality());
       passport.putString(KEY_GENDER, mrzInfo.getGender().toString());
       passport.putString(KEY_ISSUER, mrzInfo.getIssuingState());
+      passport.putString(KEY_ISSUER, mrzInfo.getIssuingState());
+      passport.putString(KEY_PERSONAL_NUMBER, mrzInfo.getPersonalNumber());
+      passport.putString(KEY_DOCUMENT_NUMBER, mrzInfo.getDocumentNumber());
+      passport.putString(KEY_EXPIRY_DATE, mrzInfo.getDateOfExpiry());
+      passport.putString(KEY_DATE_OF_BIRTH, mrzInfo.getDateOfBirth());
 
       scanPromise.resolve(passport);
       resetState();
     }
+  }
+
+  //-------------functions related to calling rust lib----------------//
+
+  // Declare native method
+  public static native String callRustCode();
+
+  @ReactMethod
+  void callRustLib(Callback callback) {
+    // Call the Rust function
+    var resultFromRust = callRustCode();
+
+    // Return the result to JavaScript through the callback
+    callback.invoke(null, resultFromRust);
+  }
+
+  public static native Integer proveRSAInRust();
+
+  @ReactMethod
+  void proveRust(Callback callback) {
+    // Call the Rust function
+    var resultFromProof = proveRSAInRust();
+
+    // Return the result to JavaScript through the callback
+    callback.invoke(null, resultFromProof);
+  }
+
+  public static native String provePassport(
+          List<String> mrz,
+          List<String> dataHashes,
+          List<String> eContentBytes,
+          List<String> signature,
+          List<String> pubkey,
+          List<String> tbsCertificate,
+          List<String> cscaPubkey,
+          List<String> dscSignature
+  );
+
+  List<String> convertArrayListToStringList(ArrayList<Object> arrayList) {
+    var stringList = new ArrayList<String>();
+    for (var i = 0; i < arrayList.size(); i++) {
+      stringList.add(arrayList.get(i).toString());
+    }
+    return stringList;
+  }
+
+  @ReactMethod
+  void provePassport(ReadableMap inputs, Callback callback) {
+    Log.d(TAG, "inputsaaa: " + inputs.toString());
+
+    var mrz = inputs.getArray("mrz") != null ? convertArrayListToStringList(inputs.getArray("mrz").toArrayList()) : new ArrayList<String>();
+    var data_hashes = inputs.getArray("dataHashes") != null ? convertArrayListToStringList(inputs.getArray("dataHashes").toArrayList()) : new ArrayList<String>();
+    var e_content_bytes = inputs.getArray("eContentBytes") != null ? convertArrayListToStringList(inputs.getArray("eContentBytes").toArrayList()) : new ArrayList<String>();
+    var signature = inputs.getArray("signature") != null ? convertArrayListToStringList(inputs.getArray("signature").toArrayList()) : new ArrayList<String>();
+    var pubkey = inputs.getArray("pubkey") != null ? convertArrayListToStringList(inputs.getArray("pubkey").toArrayList()) : new ArrayList<String>();
+    var tbs_certificate = inputs.getArray("tbsCertificate") != null ? convertArrayListToStringList(inputs.getArray("tbsCertificate").toArrayList()) : new ArrayList<String>();
+    var dsc_signature = inputs.getArray("dscSignature") != null ? convertArrayListToStringList(inputs.getArray("dscSignature").toArrayList()) : new ArrayList<String>();
+    var csca_pubkey = inputs.getArray("cscaPubkey") != null ? convertArrayListToStringList(inputs.getArray("cscaPubkey").toArrayList()) : new ArrayList<String>();
+
+    var resultFromProof = provePassport(mrz, data_hashes, e_content_bytes, signature, pubkey, tbs_certificate, csca_pubkey, dsc_signature);
+
+    Log.d(TAG, "resultFromProof: " + resultFromProof.toString());
+
+    // Return the result to JavaScript through the callback
+    callback.invoke(null, resultFromProof);
   }
 }
